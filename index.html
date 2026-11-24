@@ -137,7 +137,7 @@
 <body>
 <main>
   <p class="note"><strong>Preview</strong>
-    <span>Catalog scenes and the products under each garment are made-up sample data. Uploads are analysed for real by Claude, on your own Claude account.</span>
+    <span>Catalog scenes and the products under each garment are made-up sample data. Uploads are analysed for real by Claude.</span>
   </p>
 
   <header>
@@ -492,29 +492,73 @@ function renderScenes(q = "") {
     [el("p", { class: "desc" }, "No sample scenes match that search.")]));
 }
 
-// --- Real analysis of uploads, through the viewer's own Claude account ---
+// --- Real analysis of uploads ---
+// On the hosted site, uploads go to BollyLook's own server (/api/analyze), which calls Claude.
+// Inside a Claude artifact, they go through the viewer's own Claude account instead.
 
-const samplePromise = window.claude?.use ? window.claude.use("sample") : Promise.resolve(null);
 let imageLimits = null;
 let controller = null;
+let mode = null; // "server" | "artifact" | null
 
 const setStatus = (text, isError = false) => {
   $("#status").textContent = text;
   $("#status").className = isError ? "status error" : "status";
 };
 
+async function checkServer() {
+  if (!location.protocol.startsWith("http")) return null;
+  try {
+    const res = await fetch("api/health", { headers: { accept: "application/json" } });
+    const info = res.ok ? await res.json() : null;
+    return info?.ok ? { maxInputBytes: info.maxImageBytes } : null;
+  } catch { return null; }
+}
+
 async function checkAvailability() {
-  const sample = await samplePromise.catch(() => null);
+  const server = await checkServer();
+  if (server) {
+    mode = "server";
+    imageLimits = server;
+    setStatus("Upload a screenshot and Claude will pick out each outfit.");
+    return null;
+  }
+  const sample = window.claude?.use ? await window.claude.use("sample").catch(() => null) : null;
   imageLimits = sample ? (await sample.limits().catch(() => null))?.images ?? null : null;
   if (!imageLimits) {
     $("#find").disabled = true;
-    setStatus("Upload analysis needs Claude, which isn't available in this view. Browse the sample scenes below.");
+    setStatus("Upload analysis needs the BollyLook server, which isn't running for this page. Browse the sample scenes below.");
   } else {
+    mode = "artifact";
     setStatus("Uploads are analysed by Claude on your account. You'll be asked to allow it the first time.");
   }
   return sample;
 }
 const ready = checkAvailability();
+
+const toBase64 = (file) => new Promise((resolve, reject) => {
+  const reader = new FileReader();
+  reader.onload = () => resolve(String(reader.result).split(",")[1] || "");
+  reader.onerror = () => reject({ code: "image_rejected" });
+  reader.readAsDataURL(file);
+});
+
+async function analyseOnServer(file, movie, scene, signal) {
+  if (!["image/jpeg", "image/png", "image/webp"].includes(file.type)) throw { code: "image_rejected" };
+  const image = await toBase64(file);
+  let res;
+  try {
+    res = await fetch("api/analyze", {
+      method: "POST", signal,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ image, mediaType: file.type, movie, scene }),
+    });
+  } catch (err) {
+    throw { code: err?.name === "AbortError" ? "cancelled" : "network_error" };
+  }
+  const body = await res.json().catch(() => null);
+  if (!res.ok) throw { code: body?.error || "upstream_error" };
+  return body;
+}
 
 function buildPrompt(movie, scene) {
   const ctx = [["Film", movie], ["Song or scene", scene]].filter(([, v]) => v).map(([k, v]) => `${k}: ${v}`);
@@ -557,12 +601,15 @@ function cleanLook(raw) {
 }
 
 const ERROR_COPY = {
-  rate_limited: "You've reached your Claude usage limit for now. Try again later.",
+  rate_limited: "Too many analyses right now. Try again in a little while.",
   refused: "Claude couldn't analyse this image. Try a different still.",
   image_rejected: "That image couldn't be read. Try a JPEG, PNG or WebP screenshot.",
   invalid_json: "The analysis came back in an unexpected format. Try again.",
   empty_completion: "Claude didn't return an analysis. Try a different still.",
   session_expired: "Your Claude session expired. Sign in again, then retry.",
+  too_large: "That file is too large. Use a screenshot under 5 MB.",
+  network_error: "Couldn't reach BollyLook. Check your connection and try again.",
+  server_misconfigured: "Upload analysis isn't set up on this server yet. Browse the sample scenes below.",
 };
 const UNAVAILABLE = ["not_granted", "sampling_disabled", "not_declared", "capability_disabled",
                      "capability_removed", "images_unavailable"];
@@ -572,7 +619,7 @@ $("#upload").addEventListener("submit", async (e) => {
   const form = e.currentTarget;
   const file = form.image.files[0];
   const sample = await ready;
-  if (!sample || !imageLimits || !file) return;
+  if (!mode || !imageLimits || !file) return;
   if (file.size > imageLimits.maxInputBytes) {
     setStatus(`That file is too large. Use one under ${Math.floor(imageLimits.maxInputBytes / 1048576)} MB.`, true);
     return;
@@ -584,8 +631,10 @@ $("#upload").addEventListener("submit", async (e) => {
   $("#stop").hidden = false;
   setStatus("Reading the outfits… a new scene takes up to a minute.");
   try {
-    const raw = await sample.json(buildPrompt(movie, scene),
-      { images: [file], modelTier: "complex", effort: "medium", signal: controller.signal });
+    const raw = mode === "server"
+      ? await analyseOnServer(file, movie, scene, controller.signal)
+      : await sample.json(buildPrompt(movie, scene),
+        { images: [file], modelTier: "complex", effort: "medium", signal: controller.signal });
     const look = cleanLook(raw);
     for (const b of document.querySelectorAll(".scene")) b.setAttribute("aria-pressed", "false");
     renderLook({ title: [movie, scene].filter(Boolean).join(" — ") || "Your upload", live: true,
@@ -595,6 +644,11 @@ $("#upload").addEventListener("submit", async (e) => {
   } catch (err) {
     const code = err?.code ?? "upstream_error";
     if (code === "cancelled") setStatus("Stopped.");
+    else if (code === "server_misconfigured") {
+      $("#find").disabled = true;
+      imageLimits = null;
+      setStatus(ERROR_COPY[code], true);
+    }
     else if (UNAVAILABLE.includes(code)) {
       $("#find").disabled = true;
       imageLimits = null;

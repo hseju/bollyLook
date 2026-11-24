@@ -1,0 +1,16 @@
+{
+  "name": "bollylook",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Find Bollywood outfits, or budget dupes, on Indian shopping sites.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server/server.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.13.0"
+  }
+}
